@@ -26,9 +26,221 @@ import platform
 import subprocess
 from datetime import datetime
 import ctypes
+import ctypes.wintypes
 import json
 import re
 import hashlib
+import threading
+import itertools
+import locale
+
+# ==========================
+# Internationalisation (i18n)
+# ==========================
+
+def _detect_lang() -> str:
+    """Detect Windows UI language via GetUserDefaultUILanguage LCID, fallback to locale."""
+    try:
+        lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+        # Primary language IDs (low 10 bits of LCID)
+        primary = lcid & 0x3FF
+        # 0x16 = Portuguese, 0x0A = Spanish, 0x09 = English
+        if primary == 0x16:
+            return "pt"
+        if primary == 0x0A:
+            return "es"
+    except Exception:
+        pass
+    try:
+        loc = (locale.getdefaultlocale()[0] or "").lower()
+        if loc.startswith("pt"):
+            return "pt"
+        if loc.startswith("es"):
+            return "es"
+    except Exception:
+        pass
+    return "en"
+
+
+_STRINGS: dict[str, dict[str, str]] = {
+    "en": {
+        # Menu
+        "menu_title":       "WinSec CLI — Main Menu (Made by Thayner Kesley)",
+        "menu_os":          "OS",
+        "menu_admin":       "Admin",
+        "menu_time":        "Time",
+        "menu_admin_yes":   "YES",
+        "menu_admin_no":    "NO",
+        "select_option":    "Select option: ",
+        "invalid_option":   "Invalid option.",
+        "os_only_windows":  "[error] Windows only.",
+        # Export
+        "export_prompt":    "Export format? (txt/json/md/none): ",
+        "export_txt":       "[+] Exported TXT: {}",
+        "export_md":        "[+] Exported MD: {}",
+        "export_json":      "[+] Exported JSON: {}",
+        "export_skip":      "[-] Export skipped.",
+        # Common prompts
+        "hours_back":       "Hours to look back (default {}): ",
+        "compare_baseline": "Compare against baseline persistence JSON? (path or blank): ",
+        # Module 2
+        "filter_listening": "Filter LISTENING only? (y/N): ",
+        "filter_established":"Filter ESTABLISHED only? (y/N): ",
+        "filter_port":      "Filter by local port (blank = none): ",
+        "filter_pname":     "Filter by process name contains (blank = none): ",
+        "wifi_reveal":      "Reveal Wi-Fi key for a profile? Enter SSID or leave blank: ",
+        # Module 3
+        "show_unsigned":    "Show unsigned only? (y/N): ",
+        "show_suspath":     "Show suspicious paths only? (y/N): ",
+        "filter_port3":     "Filter by listening port (blank = none): ",
+        "filter_name3":     "Filter by name contains (blank = none): ",
+        # Module 5
+        "event_ids_prompt": "Event IDs (comma-separated) or blank for default set: ",
+        "grep_regex":       "Grep regex (case-insensitive) to filter Message (blank = none): ",
+        # Module 8
+        "days_back":        "Days back (default 7): ",
+        "ext_filter":       "Extensions to filter (comma-separated, blank=all): ",
+        "min_size":         "Min size in bytes (blank=0): ",
+        "max_size":         "Max size in bytes (blank=none): ",
+        # Module 10
+        "zip_snapshot":     "ZIP the snapshot? (y/N): ",
+        # Module 11
+        "remote_host":      "Remote hostname or IP: ",
+        # Module 12
+        "security_hours":   "Hours to look back (default 72): ",
+        # Module 13
+        "token_admin_warn": "⚠️  Privileges may be truncated — run as Administrator for the full list",
+        "token_open_err":   "[error] OpenProcessToken failed: {}",
+        "token_api_err":    "[error] Windows API failed: {}",
+        "token_exported":   "[+] Report automatically exported via write_file().",
+        "token_count":      "Total privileges: {}",
+        "token_no_wintypes":"[error] ctypes.wintypes unavailable. Run: pip install pywin32 --or-- ensure Python 3.10+ on Windows.",
+        # Progress spinner labels
+        "spin_pid_ports":   "Mapping listening ports to PIDs...",
+        "spin_enum_proc":   "Enumerating processes via WMI...",
+        "spin_sig_proc":    "Checking process signatures ({}/{})",
+        "spin_enum_svc":    "Enumerating services via WMI...",
+        "spin_sig_svc":     "Checking service signatures ({}/{})",
+        "spin_drivers":     "Querying kernel drivers...",
+        "spin_hashes":      "Computing SHA-256 for flagged binaries ({}/{})",
+        "spin_scan_dir":    "Scanning: {}",
+        "spin_sorting":     "Sorting results...",
+        "spin_done":        "Done.",
+    },
+    "pt": {
+        "menu_title":       "WinSec CLI — Menu Principal (Desenvolvido por Thayner Kesley)",
+        "menu_os":          "SO",
+        "menu_admin":       "Admin",
+        "menu_time":        "Hora",
+        "menu_admin_yes":   "SIM",
+        "menu_admin_no":    "NÃO",
+        "select_option":    "Selecione uma opção: ",
+        "invalid_option":   "Opção inválida.",
+        "os_only_windows":  "[erro] Apenas Windows.",
+        "export_prompt":    "Formato de exportação? (txt/json/md/none): ",
+        "export_txt":       "[+] Exportado TXT: {}",
+        "export_md":        "[+] Exportado MD: {}",
+        "export_json":      "[+] Exportado JSON: {}",
+        "export_skip":      "[-] Exportação cancelada.",
+        "hours_back":       "Horas para analisar (padrão {}): ",
+        "compare_baseline": "Comparar com JSON de baseline de persistência? (caminho ou vazio): ",
+        "filter_listening": "Filtrar apenas LISTENING? (s/N): ",
+        "filter_established":"Filtrar apenas ESTABLISHED? (s/N): ",
+        "filter_port":      "Filtrar por porta local (vazio = nenhum): ",
+        "filter_pname":     "Filtrar por nome do processo (vazio = nenhum): ",
+        "wifi_reveal":      "Revelar senha de Wi-Fi? Digite o SSID ou deixe vazio: ",
+        "show_unsigned":    "Exibir apenas não assinados? (s/N): ",
+        "show_suspath":     "Exibir apenas caminhos suspeitos? (s/N): ",
+        "filter_port3":     "Filtrar por porta em escuta (vazio = nenhum): ",
+        "filter_name3":     "Filtrar por nome (vazio = nenhum): ",
+        "event_ids_prompt": "IDs de evento (separados por vírgula) ou vazio para padrão: ",
+        "grep_regex":       "Regex para filtrar a mensagem (vazio = nenhum): ",
+        "days_back":        "Dias para analisar (padrão 7): ",
+        "ext_filter":       "Extensões (separadas por vírgula, vazio = todas): ",
+        "min_size":         "Tamanho mínimo em bytes (vazio = 0): ",
+        "max_size":         "Tamanho máximo em bytes (vazio = sem limite): ",
+        "zip_snapshot":     "Compactar o snapshot em ZIP? (s/N): ",
+        "remote_host":      "Hostname ou IP remoto: ",
+        "security_hours":   "Horas para analisar (padrão 72): ",
+        "token_admin_warn": "⚠️  Privilégios podem estar truncados — execute como Administrador para a lista completa",
+        "token_open_err":   "[erro] OpenProcessToken falhou: {}",
+        "token_api_err":    "[erro] API do Windows falhou: {}",
+        "token_exported":   "[+] Relatório exportado automaticamente via write_file().",
+        "token_count":      "Total de privilégios: {}",
+        "token_no_wintypes":"[erro] ctypes.wintypes indisponível. Execute: pip install pywin32 --ou-- certifique-se de usar Python 3.10+ no Windows.",
+        "spin_pid_ports":   "Mapeando portas em escuta por PID...",
+        "spin_enum_proc":   "Enumerando processos via WMI...",
+        "spin_sig_proc":    "Verificando assinaturas de processos ({}/{})",
+        "spin_enum_svc":    "Enumerando serviços via WMI...",
+        "spin_sig_svc":     "Verificando assinaturas de serviços ({}/{})",
+        "spin_drivers":     "Consultando drivers do kernel...",
+        "spin_hashes":      "Calculando SHA-256 de binários sinalizados ({}/{})",
+        "spin_scan_dir":    "Escaneando: {}",
+        "spin_sorting":     "Ordenando resultados...",
+        "spin_done":        "Concluído.",
+    },
+    "es": {
+        "menu_title":       "WinSec CLI — Menú Principal (Desarrollado por Thayner Kesley)",
+        "menu_os":          "SO",
+        "menu_admin":       "Admin",
+        "menu_time":        "Hora",
+        "menu_admin_yes":   "SÍ",
+        "menu_admin_no":    "NO",
+        "select_option":    "Seleccione una opción: ",
+        "invalid_option":   "Opción inválida.",
+        "os_only_windows":  "[error] Solo Windows.",
+        "export_prompt":    "Formato de exportación? (txt/json/md/none): ",
+        "export_txt":       "[+] Exportado TXT: {}",
+        "export_md":        "[+] Exportado MD: {}",
+        "export_json":      "[+] Exportado JSON: {}",
+        "export_skip":      "[-] Exportación omitida.",
+        "hours_back":       "Horas a analizar (predeterminado {}): ",
+        "compare_baseline": "¿Comparar con JSON de baseline de persistencia? (ruta o vacío): ",
+        "filter_listening": "¿Filtrar solo LISTENING? (s/N): ",
+        "filter_established":"¿Filtrar solo ESTABLISHED? (s/N): ",
+        "filter_port":      "Filtrar por puerto local (vacío = ninguno): ",
+        "filter_pname":     "Filtrar por nombre de proceso (vacío = ninguno): ",
+        "wifi_reveal":      "¿Revelar clave Wi-Fi? Ingrese SSID o deje vacío: ",
+        "show_unsigned":    "¿Mostrar solo no firmados? (s/N): ",
+        "show_suspath":     "¿Mostrar solo rutas sospechosas? (s/N): ",
+        "filter_port3":     "Filtrar por puerto en escucha (vacío = ninguno): ",
+        "filter_name3":     "Filtrar por nombre (vacío = ninguno): ",
+        "event_ids_prompt": "IDs de evento (separados por coma) o vacío para predeterminado: ",
+        "grep_regex":       "Regex para filtrar mensaje (vacío = ninguno): ",
+        "days_back":        "Días a analizar (predeterminado 7): ",
+        "ext_filter":       "Extensiones (separadas por coma, vacío = todas): ",
+        "min_size":         "Tamaño mínimo en bytes (vacío = 0): ",
+        "max_size":         "Tamaño máximo en bytes (vacío = sin límite): ",
+        "zip_snapshot":     "¿Comprimir snapshot en ZIP? (s/N): ",
+        "remote_host":      "Hostname o IP remoto: ",
+        "security_hours":   "Horas a analizar (predeterminado 72): ",
+        "token_admin_warn": "⚠️  Los privilegios pueden estar truncados — ejecute como Administrador para la lista completa",
+        "token_open_err":   "[error] OpenProcessToken falló: {}",
+        "token_api_err":    "[error] API de Windows falló: {}",
+        "token_exported":   "[+] Informe exportado automáticamente via write_file().",
+        "token_count":      "Total de privilegios: {}",
+        "token_no_wintypes":"[error] ctypes.wintypes no disponible. Ejecute: pip install pywin32 --o-- asegúrese de usar Python 3.10+ en Windows.",
+        "spin_pid_ports":   "Mapeando puertos en escucha por PID...",
+        "spin_enum_proc":   "Enumerando procesos via WMI...",
+        "spin_sig_proc":    "Verificando firmas de procesos ({}/{})",
+        "spin_enum_svc":    "Enumerando servicios via WMI...",
+        "spin_sig_svc":     "Verificando firmas de servicios ({}/{})",
+        "spin_drivers":     "Consultando drivers del kernel...",
+        "spin_hashes":      "Calculando SHA-256 de binarios marcados ({}/{})",
+        "spin_scan_dir":    "Escaneando: {}",
+        "spin_sorting":     "Ordenando resultados...",
+        "spin_done":        "Completado.",
+    },
+}
+
+_LANG = _detect_lang()
+
+
+def t(key: str, *args) -> str:
+    """Return translated string for current system language, fallback to English."""
+    s = _STRINGS.get(_LANG, _STRINGS["en"]).get(key) or _STRINGS["en"].get(key, key)
+    return s.format(*args) if args else s
+
 
 # ==========================
 # Utilities
@@ -66,25 +278,72 @@ def write_file(basename: str, content: str, ext: str = "txt") -> str:
 
 
 def export_prompt(default_name: str, text_dump: str, json_obj: dict | None = None):
-    print("\nExport format? (txt/json/md/none): ", end="")
+    print(t("export_prompt"), end="")
     fmt = input().strip().lower()
     if fmt == "txt":
         path = write_file(default_name, text_dump, "txt")
-        print(f"[+] Exported TXT: {path}")
+        print(t("export_txt", path))
     elif fmt == "md":
         md = f"# {default_name}\n\n````\n{text_dump}\n````\n"
         path = write_file(default_name, md, "md")
-        print(f"[+] Exported MD: {path}")
+        print(t("export_md", path))
     elif fmt == "json":
         if json_obj is None:
             json_obj = {"generated_at": now_str(), "text": text_dump}
         path = write_file(default_name, json.dumps(json_obj, indent=2), "json")
-        print(f"[+] Exported JSON: {path}")
+        print(t("export_json", path))
     else:
-        print("[-] Export skipped.")
+        print(t("export_skip"))
 
 def maybe_export(default_name: str, text_dump: str, json_obj: dict | None = None):
     return export_prompt(default_name, text_dump, json_obj)
+
+# ==========================
+# Progress Spinner
+# ==========================
+
+class Spinner:
+    """Thread-safe CLI spinner. Shows the user the app is alive during long ops."""
+
+    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self):
+        self._msg   = ""
+        self._stop  = threading.Event()
+        self._lock  = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self, message: str = "") -> "Spinner":
+        self._msg = message
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def update(self, message: str) -> None:
+        with self._lock:
+            self._msg = message
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+        # Clear the spinner line
+        sys.stdout.write("\r" + " " * 90 + "\r")
+        sys.stdout.flush()
+
+    def _loop(self) -> None:
+        for ch in itertools.cycle(self._FRAMES):
+            if self._stop.is_set():
+                break
+            with self._lock:
+                msg = self._msg
+            line = f"\r{ch}  {msg}"
+            sys.stdout.write(line[:88].ljust(88))
+            sys.stdout.flush()
+            self._stop.wait(0.1)
+
+
 
 def header(title: str) -> str:
     line = "=" * 104
@@ -408,25 +667,35 @@ def mod_process_services():
     out.append(header("[3] Processes & Services"))
 
     # Interactive filters
-    print("Show unsigned only? (y/N): ", end=""); f_unsigned = input().strip().lower().startswith('y')
-    print("Show suspicious paths only? (y/N): ", end=""); f_suspath = input().strip().lower().startswith('y')
-    print("Filter by listening port (blank = none): ", end=""); f_port = input().strip()
-    print("Filter by name contains (blank = none): ", end=""); f_name = input().strip().lower()
+    print(t("show_unsigned"), end=""); f_unsigned = input().strip().lower().startswith('y')
+    print(t("show_suspath"), end=""); f_suspath = input().strip().lower().startswith('y')
+    print(t("filter_port3"), end=""); f_port = input().strip()
+    print(t("filter_name3"), end=""); f_name = input().strip().lower()
+
+    spinner = Spinner()
 
     # Port map by PID
+    spinner.start(t("spin_pid_ports"))
     pid_ports = parse_listening_ports_by_pid()
+    spinner.stop()
 
     # --- Processes ---
+    spinner.start(t("spin_enum_proc"))
     procs = get_processes()
+    spinner.stop()
+
     rows_p = []
     sig_cache = {}
     hash_targets = set()
+    total_p = len(procs) if isinstance(procs, list) else 0
 
-    for p in (procs if isinstance(procs, list) else []):
+    for i, p in enumerate(procs if isinstance(procs, list) else []):
         pid = p.get('ProcessId')
         name = p.get('Name') or ''
         path = p.get('ExecutablePath') or ''
         cmd = p.get('CommandLine') or ''
+        spinner.update(t("spin_sig_proc", i + 1, total_p))
+        spinner.start() if i == 0 else None
         sig = sig_cache.get(path)
         if sig is None:
             sig = check_signature(path)
@@ -458,16 +727,26 @@ def mod_process_services():
             if path:
                 hash_targets.add(path)
 
+    if total_p > 0:
+        spinner.stop()
+
     # --- Services ---
+    spinner.start(t("spin_enum_svc"))
     srvs = get_services()
+    spinner.stop()
+
     rows_s = []
-    for s in (srvs if isinstance(srvs, list) else []):
+    total_s = len(srvs) if isinstance(srvs, list) else 0
+
+    for i, s in enumerate(srvs if isinstance(srvs, list) else []):
         name = s.get('Name') or ''
         disp = s.get('DisplayName') or ''
         state = s.get('State') or ''
         start = s.get('StartMode') or ''
         pn = s.get('PathName') or ''
         exe = extract_exe_from_pathname(pn)
+        spinner.update(t("spin_sig_svc", i + 1, total_s))
+        spinner.start() if i == 0 else None
         sig = sig_cache.get(exe)
         if sig is None:
             sig = check_signature(exe)
@@ -492,6 +771,9 @@ def mod_process_services():
             if exe:
                 hash_targets.add(exe)
 
+    if total_s > 0:
+        spinner.stop()
+
     # Format output
     def fmt_procs(rows):
         out = []
@@ -514,16 +796,23 @@ def mod_process_services():
     out.append("\n[Services]\n" + (fmt_services(rows_s) if rows_s else "(no matches)"))
 
     # Drivers (raw)
-    out.append("\n[Drivers — driverquery /v]\n" + get_drivers_raw())
+    spinner.start(t("spin_drivers"))
+    drivers_raw = get_drivers_raw()
+    spinner.stop()
+    out.append("\n[Drivers — driverquery /v]\n" + drivers_raw)
 
     # Hashes for flagged binaries (limit to 150)
     out.append("\n[SHA256 for flagged binaries]\n")
-    for i, pth in enumerate(sorted(hash_targets)):
+    hash_list = sorted(hash_targets)
+    spinner.start(t("spin_hashes", 0, len(hash_list)))
+    for i, pth in enumerate(hash_list):
         if i >= 150:
             out.append("(truncated)")
             break
+        spinner.update(t("spin_hashes", i + 1, len(hash_list)))
         h = sha256_file(pth)
         out.append(f"{pth} -> {h if h else 'hash_error_or_missing'}")
+    spinner.stop()
 
     content = "\n".join(out)
     print(content)
@@ -793,23 +1082,53 @@ def mod_quick_forensics():
     out = []
     out.append(header("Quick Forensics — recent files"))
 
-    print("Days back (default 7): ", end=""); d = input().strip()
+    print(t("days_back", 7), end=""); d = input().strip()
     try: days = int(d) if d else 7
     except: days = 7
 
-    print("Extensions to filter (comma-separated, blank=all): ", end=""); e = input().strip()
+    print(t("ext_filter"), end=""); e = input().strip()
     exts = [x.strip() for x in e.split(',') if x.strip()] if e else None
 
-    print("Min size in bytes (blank=0): ", end=""); m1 = input().strip()
+    print(t("min_size"), end=""); m1 = input().strip()
     try: min_b = int(m1) if m1 else 0
     except: min_b = 0
 
-    print("Max size in bytes (blank=none): ", end=""); m2 = input().strip()
+    print(t("max_size"), end=""); m2 = input().strip()
     try: max_b = int(m2) if m2 else None
     except: max_b = None
 
     targets = [r"%TEMP%", r"%APPDATA%", r"%LOCALAPPDATA%", r"C:\\ProgramData", r"%USERPROFILE%\\Downloads", r"%USERPROFILE%\\Desktop"]
-    rows = list_recent_files(targets, days=days, exts=exts, min_bytes=min_b, max_bytes=max_b)
+
+    spinner = Spinner()
+    rows: list = []
+
+    cutoff = datetime.now().timestamp() - days * 86400
+    for target in targets:
+        exp = os.path.expandvars(target)
+        spinner.start(t("spin_scan_dir", exp))
+        for root, _dirs, files in os.walk(exp):
+            spinner.update(t("spin_scan_dir", root[:70]))
+            for fn in files:
+                fpath = os.path.join(root, fn)
+                try:
+                    stat = os.stat(fpath)
+                    if stat.st_mtime < cutoff:
+                        continue
+                    if min_b and stat.st_size < min_b:
+                        continue
+                    if max_b and stat.st_size > max_b:
+                        continue
+                    if exts:
+                        if not any(fn.lower().endswith(ex.lower()) for ex in exts):
+                            continue
+                    rows.append((datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"), fpath, stat.st_size))
+                except Exception:
+                    continue
+        spinner.stop()
+
+    spinner.start(t("spin_sorting"))
+    rows.sort(key=lambda x: x[0], reverse=True)
+    spinner.stop()
 
     if not rows:
         out.append("No recent files found under given criteria.")
@@ -1171,8 +1490,18 @@ def mod_token_privileges() -> None:
     out = []
     out.append(header("[13] Token Privileges — Windows API (ctypes)"))
 
+    # Verificação explícita de ctypes.wintypes antes de qualquer uso
+    try:
+        import ctypes.wintypes as _wintypes
+        _HANDLE = _wintypes.HANDLE
+        _DWORD  = _wintypes.DWORD
+    except (ImportError, AttributeError):
+        msg = t("token_no_wintypes")
+        print(msg)
+        return
+
     if not is_admin():
-        warn = "⚠️  Privilégios podem estar truncados — execute como Admin para lista completa"
+        warn = t("token_admin_warn")
         print(warn)
         out.append(warn + "\n")
 
@@ -1185,17 +1514,18 @@ def mod_token_privileges() -> None:
     advapi32  = ctypes.windll.advapi32
 
     hProcess = kernel32.GetCurrentProcess()
-    hToken   = ctypes.wintypes.HANDLE()
+    hToken   = _HANDLE()
 
     if not advapi32.OpenProcessToken(hProcess, TOKEN_QUERY, ctypes.byref(hToken)):
         err = ctypes.WinError(ctypes.get_last_error())
-        print(f"[error] OpenProcessToken falhou: {err}")
-        out.append(f"[error] OpenProcessToken falhou: {err}")
+        msg = t("token_open_err", err)
+        print(msg)
+        out.append(msg)
         return
 
     try:
         # --- 1ª chamada: obter tamanho necessário do buffer ---
-        return_length = ctypes.wintypes.DWORD(0)
+        return_length = _DWORD(0)
         advapi32.GetTokenInformation(
             hToken,
             TokenPrivileges,
@@ -1238,12 +1568,12 @@ def mod_token_privileges() -> None:
         col_luid  = 20
         sep = f"{'─' * col_name}+{'─' * col_attr}+{'─' * col_luid}"
         hdr = f"{'Privilege Name':<{col_name}}| {'Attributes':<{col_attr}}| {'LUID (High:Low)':<{col_luid}}"
-        out.append(f"Total de privilégios: {count}\n")
+        out.append(t("token_count", count) + "\n")
         out.append(hdr)
         out.append(sep)
 
         name_buf  = ctypes.create_unicode_buffer(256)
-        name_size = ctypes.wintypes.DWORD(256)
+        name_size = _DWORD(256)
 
         for i in range(count):
             luid  = privileges[i].Luid
@@ -1274,8 +1604,7 @@ def mod_token_privileges() -> None:
         out.append(sep)
 
     except ctypes.WinError as we:
-        # Mensagem de erro legível via FormatMessageW (encapsulado em WinError)
-        msg = f"[error] Windows API falhou: {we}"
+        msg = t("token_api_err", we)
         print(msg)
         out.append(msg)
     finally:
@@ -1284,9 +1613,8 @@ def mod_token_privileges() -> None:
 
     content = "\n".join(out)
     print(content)
-    # Exportação reutiliza write_file() do winsec.py — não cria handler próprio
     write_file("token_privileges", content, ext="txt")
-    print(f"[+] Relatório exportado automaticamente via write_file().")
+    print(t("token_exported"))
     maybe_export("token_privileges", content)
 
 
@@ -1295,26 +1623,27 @@ def mod_token_privileges() -> None:
 # ==========================
 
 def print_menu():
+    admin_str = t("menu_admin_yes") if is_admin() else t("menu_admin_no")
     print(" "*104)
-    print("WinSec CLI — Main Menu (Made by Thayner Kesley)")
+    print(t("menu_title"))
     print("\033[4;34mGitHub: https://github.com/ThaynerKesley\033[0m")
-    print(f"OS: {platform.platform()} | Admin: {'YES' if is_admin() else 'NO'} | Time: {now_str()}")
+    print(f"{t('menu_os')}: {platform.platform()} | {t('menu_admin')}: {admin_str} | {t('menu_time')}: {now_str()}")
     print(" "*104)
     print("-"*104)
-    print("1) System Information")
-    print("2) Network Analysis")
-    print("3) Processes & Services")
-    print("4) Persistence (Run Keys / Startup / Tasks / WMI / IFEO)")
-    print("5) Event Logs / Threat Hunting")
-    print("6) Windows Defender (status & scans)")
-    print("7) Security Policies / Audit / Firewall")
-    print("8) Quick Forensics (recent files)")
-    print("9) Threat Hunting — Quick Wins")
+    print("1)  System Information")
+    print("2)  Network Analysis")
+    print("3)  Processes & Services")
+    print("4)  Persistence (Run Keys / Startup / Tasks / WMI / IFEO)")
+    print("5)  Event Logs / Threat Hunting")
+    print("6)  Windows Defender (status & scans)")
+    print("7)  Security Policies / Audit / Firewall")
+    print("8)  Quick Forensics (recent files)")
+    print("9)  Threat Hunting — Quick Wins")
     print("10) Incident Response — Bundle Snapshot")
     print("11) Remote Assessment (PowerShell Remoting)")
-    print("12) Security Summary — Consolidated")
+    print("12) Security Summary — Consolidated Score")
     print("13) Token Privileges — Windows API (ctypes)")
-    print("0) Exit")
+    print("0)  Exit")
     print("-"*104)
 
 actions = {
@@ -1335,18 +1664,18 @@ actions = {
 
 def main():
     if not is_windows():
-        print("[error] Windows only.")
+        print(t("os_only_windows"))
         sys.exit(1)
     while True:
         print_menu()
-        choice = input("Select option: ").strip()
+        choice = input(t("select_option")).strip()
         if choice == "0":
             break
         func = actions.get(choice)
         if func:
             func()
         else:
-            print("Invalid option.")
+            print(t("invalid_option"))
 
 
 if __name__ == "__main__":
