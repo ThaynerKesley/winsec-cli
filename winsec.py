@@ -1126,6 +1126,171 @@ def mod_security_summary():
     maybe_export("security_summary", content)
 
 # ==========================
+# [13] Token Privileges — ctypes + Windows API
+# ==========================
+
+# --- Constantes nomeadas (winnt.h) — NÃO alterar para magic numbers ---
+SE_PRIVILEGE_ENABLED            = 0x00000002
+SE_PRIVILEGE_ENABLED_BY_DEFAULT = 0x00000001
+SE_PRIVILEGE_REMOVED            = 0x00000004
+SE_PRIVILEGE_USED_FOR_ACCESS    = 0x00080000
+TOKEN_QUERY                     = 0x0008
+TokenPrivileges                 = 20  # TOKEN_INFORMATION_CLASS
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [
+        ("LowPart",  ctypes.c_ulong),
+        ("HighPart", ctypes.c_long),
+    ]
+
+
+class _LUID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Luid",       _LUID),
+        ("Attributes", ctypes.c_ulong),
+    ]
+
+
+class _TOKEN_PRIVILEGES(ctypes.Structure):
+    """Placeholder com 1 entrada; cast dinâmico alocado via create_string_buffer."""
+    _fields_ = [
+        ("PrivilegeCount", ctypes.c_ulong),
+        ("Privileges",     _LUID_AND_ATTRIBUTES * 1),
+    ]
+
+
+def mod_token_privileges() -> None:
+    """
+    Lista privilégios do token atual via ctypes + Windows API.
+    Output: print() formatado + opção de export via write_file().
+    Requer: Windows, privilégios de leitura de token (user ou admin).
+    """
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    out = []
+    out.append(header("[13] Token Privileges — Windows API (ctypes)"))
+
+    if not is_admin():
+        warn = "⚠️  Privilégios podem estar truncados — execute como Admin para lista completa"
+        print(warn)
+        out.append(warn + "\n")
+
+    if not is_windows():
+        msg = "[error] Este módulo requer Windows."
+        print(msg)
+        return
+
+    kernel32  = ctypes.windll.kernel32
+    advapi32  = ctypes.windll.advapi32
+
+    hProcess = kernel32.GetCurrentProcess()
+    hToken   = ctypes.wintypes.HANDLE()
+
+    if not advapi32.OpenProcessToken(hProcess, TOKEN_QUERY, ctypes.byref(hToken)):
+        err = ctypes.WinError(ctypes.get_last_error())
+        print(f"[error] OpenProcessToken falhou: {err}")
+        out.append(f"[error] OpenProcessToken falhou: {err}")
+        return
+
+    try:
+        # --- 1ª chamada: obter tamanho necessário do buffer ---
+        return_length = ctypes.wintypes.DWORD(0)
+        advapi32.GetTokenInformation(
+            hToken,
+            TokenPrivileges,
+            None,
+            0,
+            ctypes.byref(return_length),
+        )
+
+        if return_length.value == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        # --- Alocação segura via create_string_buffer (sem divisão inteira) ---
+        buffer = ctypes.create_string_buffer(return_length.value)
+
+        # --- 2ª chamada: preencher buffer ---
+        success = advapi32.GetTokenInformation(
+            hToken,
+            TokenPrivileges,
+            buffer,
+            return_length,
+            ctypes.byref(return_length),
+        )
+        if not success:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        # --- Cast dinâmico para estrutura TOKEN_PRIVILEGES ---
+        tp = ctypes.cast(buffer, ctypes.POINTER(_TOKEN_PRIVILEGES)).contents
+        count = tp.PrivilegeCount
+
+        # Reinterpretar Privileges[] com o tamanho real
+        LuidAttrArray = _LUID_AND_ATTRIBUTES * count
+        privileges = ctypes.cast(
+            ctypes.addressof(tp.Privileges),
+            ctypes.POINTER(LuidAttrArray),
+        ).contents
+
+        # --- Cabeçalho da tabela ---
+        col_name  = 45
+        col_attr  = 35
+        col_luid  = 20
+        sep = f"{'─' * col_name}+{'─' * col_attr}+{'─' * col_luid}"
+        hdr = f"{'Privilege Name':<{col_name}}| {'Attributes':<{col_attr}}| {'LUID (High:Low)':<{col_luid}}"
+        out.append(f"Total de privilégios: {count}\n")
+        out.append(hdr)
+        out.append(sep)
+
+        name_buf  = ctypes.create_unicode_buffer(256)
+        name_size = ctypes.wintypes.DWORD(256)
+
+        for i in range(count):
+            luid  = privileges[i].Luid
+            attrs = privileges[i].Attributes
+
+            # LookupPrivilegeNameW — resolve LUID → nome legível
+            name_size.value = 256
+            ok = advapi32.LookupPrivilegeNameW(
+                None,
+                ctypes.byref(luid),
+                name_buf,
+                ctypes.byref(name_size),
+            )
+            priv_name = name_buf.value if ok else f"<unknown:{luid.HighPart}:{luid.LowPart}>"
+
+            # Decodificar todos os flags (exibir TODOS, inclusive Disabled)
+            flags = []
+            if attrs & SE_PRIVILEGE_ENABLED:            flags.append("Enabled")
+            if attrs & SE_PRIVILEGE_ENABLED_BY_DEFAULT: flags.append("Default")
+            if attrs & SE_PRIVILEGE_REMOVED:            flags.append("Removed")
+            if attrs & SE_PRIVILEGE_USED_FOR_ACCESS:    flags.append("UsedForAccess")
+            attr_str = " | ".join(flags) if flags else "Disabled"
+
+            luid_str = f"{luid.HighPart}:{luid.LowPart}"
+            row = f"{priv_name:<{col_name}}| {attr_str:<{col_attr}}| {luid_str:<{col_luid}}"
+            out.append(row)
+
+        out.append(sep)
+
+    except ctypes.WinError as we:
+        # Mensagem de erro legível via FormatMessageW (encapsulado em WinError)
+        msg = f"[error] Windows API falhou: {we}"
+        print(msg)
+        out.append(msg)
+    finally:
+        # CloseHandle SEMPRE executado, independente de erros
+        kernel32.CloseHandle(hToken)
+
+    content = "\n".join(out)
+    print(content)
+    # Exportação reutiliza write_file() do winsec.py — não cria handler próprio
+    write_file("token_privileges", content, ext="txt")
+    print(f"[+] Relatório exportado automaticamente via write_file().")
+    maybe_export("token_privileges", content)
+
+
+# ==========================
 # Menu
 # ==========================
 
@@ -1148,6 +1313,7 @@ def print_menu():
     print("10) Incident Response — Bundle Snapshot")
     print("11) Remote Assessment (PowerShell Remoting)")
     print("12) Security Summary — Consolidated")
+    print("13) Token Privileges — Windows API (ctypes)")
     print("0) Exit")
     print("-"*104)
 
@@ -1164,6 +1330,7 @@ actions = {
     "10": mod_incident_response,
     "11": mod_remote_assessment,
     "12": mod_security_summary,
+    "13": mod_token_privileges,
 }
 
 def main():
